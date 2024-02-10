@@ -1,12 +1,20 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 )
+
+type Config struct {
+	WhiteList []string `json:"white_list"`
+	BlackList []string `json:"black_list"`
+	SizeLimit int64    `json:"size_limit"`
+}
 
 var (
 	exp1 = regexp.MustCompile(`^(?:https?://)?github\.com/(?P<author>.+?)/(?P<repo>.+?)/(?:releases|archive)/.*$`)
@@ -39,7 +47,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if m := checkURL(u); m != nil {
 		// For demonstration, just printing the matched groups
 		fmt.Printf("Author: %s, Repo: %s\n", m["author"], m["repo"])
-		proxy(w, r)
+		if allowDownload(m["author"], m["repo"]) {
+			proxy(w, r)
+		} else {
+			http.Error(w, "Download not allowed.", http.StatusForbidden)
+		}
 	} else {
 		http.Error(w, "Invalid input.", http.StatusForbidden)
 	}
@@ -49,8 +61,6 @@ func index(w http.ResponseWriter, r *http.Request) {
 	// 提供 index.html 文件内容
 	http.ServeFile(w, r, "index.html")
 }
-
-
 
 func iconHandler(w http.ResponseWriter, r *http.Request) {
 	// Return favicon.ico
@@ -108,8 +118,6 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-
-
 func iterContent(r *http.Response, chunkSize int) <-chan []byte {
 	ch := make(chan []byte)
 
@@ -131,4 +139,52 @@ func iterContent(r *http.Response, chunkSize int) <-chan []byte {
 	}()
 
 	return ch
+}
+
+func allowDownload(author, repo string) bool {
+	config := readConfig("config.json")
+	if config == nil {
+		fmt.Println("Failed to read config.")
+		return false
+	}
+
+	// Check blacklist
+	for _, entry := range config.BlackList {
+		if entry == author || entry == author+"/"+repo {
+			return false
+		}
+	}
+
+	// Check whitelist
+	if len(config.WhiteList) > 0 {
+		for _, entry := range config.WhiteList {
+			if entry == author || entry == author+"/"+repo {
+				return true
+			}
+		}
+		// If whitelist is defined but entry not found, disallow download
+		return false
+	}
+
+	// If whitelist is not defined, allow download by default
+	return true
+}
+
+func readConfig(filename string) *Config {
+	file, err := os.Open(filename)
+	if err != nil {
+		fmt.Println("Error opening config file:", err)
+		return nil
+	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+	config := Config{}
+	err = decoder.Decode(&config)
+	if err != nil {
+		fmt.Println("Error decoding config file:", err)
+		return nil
+	}
+
+	return &config
 }
