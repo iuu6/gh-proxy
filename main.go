@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -27,7 +28,7 @@ var (
 func main() {
 	http.HandleFunc("/", handler)
 	http.HandleFunc("/favicon.ico", iconHandler)
-	http.ListenAndServe(":8080", nil)
+	http.ListenAndServe(":5340", nil)
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -44,6 +45,13 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Println("Received URL:", u)
 
+	// 解码 URL
+	u, err := url.PathUnescape(u)
+	if err != nil {
+		http.Error(w, "Failed to decode URL.", http.StatusInternalServerError)
+		return
+	}
+
 	if m := checkURL(u); m != nil {
 		// For demonstration, just printing the matched groups
 		fmt.Printf("Author: %s, Repo: %s\n", m["author"], m["repo"])
@@ -56,6 +64,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid input.", http.StatusForbidden)
 	}
 }
+
 
 func index(w http.ResponseWriter, r *http.Request) {
 	// 提供 index.html 文件内容
@@ -103,20 +112,23 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 		if matches := regexp.MustCompile(`filename="?([^"]+)"?`).FindStringSubmatch(disposition); len(matches) > 1 {
 			filename = matches[1]
 		}
+	} else {
+		// 从 URL 中提取文件名
+		parts := strings.Split(u, "/")
+		filename = parts[len(parts)-1]
 	}
 
 	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
-	w.Header().Set("Content-Length", resp.Header.Get("Content-Length"))
 
-	ch := iterContent(resp, 1024)
-	for chunk := range ch {
-		if _, err := w.Write(chunk); err != nil {
-			fmt.Println("Error writing response:", err)
-			return
-		}
+	// 直接传输响应体
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		fmt.Println("Error writing response:", err)
+		return
 	}
 }
+
+
 
 func iterContent(r *http.Response, chunkSize int) <-chan []byte {
 	ch := make(chan []byte)
