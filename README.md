@@ -16,3 +16,21 @@
 ```
 它可以配置**特定用户/用户的特定仓库**的黑白名单，设置**最大文件下载大小**等1073741824就是1GB
 **注意这只是一个参考示例**
+
+# systemd进程守护配置
+
+**注意**：这只是一个参考！
+```
+[Unit]
+Description=GitHub API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/local/ghapi
+ExecStart=/usr/local/ghapi/main
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
