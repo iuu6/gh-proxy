@@ -1,5 +1,6 @@
 {
     "white_list": [],
     "black_list": [],
-    "size_limit": 1073741824
+    "size_limit": 1073741824,
+    "socks5": ""
 }
