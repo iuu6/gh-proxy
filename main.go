@@ -2,32 +2,44 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
-	"io"
+	"flag"
+	"log"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
+	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 type Config struct {
 	WhiteList []string `json:"white_list"`
 	BlackList []string `json:"black_list"`
 	SizeLimit int64    `json:"size_limit"`
+	Socks5    string   `json:"socks5"`
 }
 
 var (
-	exp1 = regexp.MustCompile(`^(?:https?://)?github\.com/(?P<author>.+?)/(?P<repo>.+?)/(?:releases|archive)/.*$`)
-	exp2 = regexp.MustCompile(`^(?:https?://)?github\.com/(?P<author>.+?)/(?P<repo>.+?)/(?:blob|raw)/.*$`)
-	exp3 = regexp.MustCompile(`^(?:https?://)?github\.com/(?P<author>.+?)/(?P<repo>.+?)/(?:info|git-).*$`)
-	exp4 = regexp.MustCompile(`^(?:https?://)?raw\.(?:githubusercontent|github)\.com/(?P<author>.+?)/(?P<repo>.+?)/.+?/.+$`)
-	exp5 = regexp.MustCompile(`^(?:https?://)?gist\.(?:githubusercontent|github)\.com/(?P<author>.+?)/.+?/.+$`)
+	exp1      = regexp.MustCompile(`^(?:https?://)?github\.com/(?P<author>.+?)/(?P<repo>.+?)/(?:releases|archive)/.*$`)
+	exp2      = regexp.MustCompile(`^(?:https?://)?github\.com/(?P<author>.+?)/(?P<repo>.+?)/(?:blob|raw)/.*$`)
+	exp3      = regexp.MustCompile(`^(?:https?://)?github\.com/(?P<author>.+?)/(?P<repo>.+?)/(?:info|git-).*$`)
+	exp4      = regexp.MustCompile(`^(?:https?://)?raw\.(?:githubusercontent|github)\.com/(?P<author>.+?)/(?P<repo>.+?)/.+?/.+$`)
+	exp5      = regexp.MustCompile(`^(?:https?://)?gist\.(?:githubusercontent|github)\.com/(?P<author>.+?)/.+?/.+$`)
+	config    Config
+	transport *http.Transport
 )
 
 func main() {
+	config_path := flag.String("c", "config.json", "Path to the config file")
+	flag.Parse()
+	config = *readConfig(*config_path)
+
 	http.HandleFunc("/", handler)
 	http.HandleFunc("/favicon.ico", iconHandler)
+	log.Println("Listening on :5340")
 	http.ListenAndServe(":5340", nil)
 }
 
@@ -43,7 +55,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmt.Println("Received URL:", u)
+	log.Printf("Received URL: %s\n", u)
 
 	// 解码 URL
 	u, err := url.PathUnescape(u)
@@ -54,9 +66,10 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	if m := checkURL(u); m != nil {
 		// For demonstration, just printing the matched groups
-		fmt.Printf("Author: %s, Repo: %s\n", m["author"], m["repo"])
+		m["repo"] = strings.TrimSuffix(m["repo"], ".git")
+		log.Printf("Author: %s, Repo: %s\n", m["author"], m["repo"])
 		if allowDownload(m["author"], m["repo"]) {
-			proxy(w, r)
+			proxyHandler(w, r)
 		} else {
 			http.Error(w, "Download not allowed.", http.StatusForbidden)
 		}
@@ -64,7 +77,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid input.", http.StatusForbidden)
 	}
 }
-
 
 func index(w http.ResponseWriter, r *http.Request) {
 	// 提供 index.html 文件内容
@@ -93,73 +105,27 @@ func checkURL(u string) map[string]string {
 	return nil
 }
 
-func proxy(w http.ResponseWriter, r *http.Request) {
+func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	u := r.URL.Path[1:]
 	// 修正 URL，确保路径开头有两个斜杠
 	u = strings.Replace(u, "https:/", "https://", 1)
 	u = strings.Replace(u, "http:/", "http://", 1)
+	// 获取第三个/之前的内容，即https://github.com
+	url, _ := url.Parse(strings.Join(strings.Split(u, "/")[:3], "/"))
+	proxy := httputil.NewSingleHostReverseProxy(url)
+	proxy.Transport = transport
 
-	resp, err := http.Get(u)
-	if err != nil {
-		http.Error(w, "Failed to fetch resource.", http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
+	// 删除第三个/及之前的内容，即path
+	r.URL.Path = "/" + strings.Join(strings.Split(r.URL.Path, "/")[3:], "/")
+	r.Host = url.Host
+	r.URL.Host = url.Host
+	r.URL.Scheme = url.Scheme
+	r.Header.Set("Host", url.Host)
 
-	// 获取文件名
-	filename := "downloaded_file.zip"
-	if disposition := resp.Header.Get("Content-Disposition"); disposition != "" {
-		if matches := regexp.MustCompile(`filename="?([^"]+)"?`).FindStringSubmatch(disposition); len(matches) > 1 {
-			filename = matches[1]
-		}
-	} else {
-		// 从 URL 中提取文件名
-		parts := strings.Split(u, "/")
-		filename = parts[len(parts)-1]
-	}
-
-	w.Header().Set("Content-Disposition", "attachment; filename="+filename)
-	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
-
-	// 直接传输响应体
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		fmt.Println("Error writing response:", err)
-		return
-	}
-}
-
-
-
-func iterContent(r *http.Response, chunkSize int) <-chan []byte {
-	ch := make(chan []byte)
-
-	go func() {
-		defer close(ch)
-
-		for {
-			chunk := make([]byte, chunkSize)
-			n, err := r.Body.Read(chunk)
-			if err != nil {
-				if err == io.EOF {
-					return
-				}
-				fmt.Println("Error reading response body:", err)
-				return
-			}
-			ch <- chunk[:n]
-		}
-	}()
-
-	return ch
+	proxy.ServeHTTP(w, r)
 }
 
 func allowDownload(author, repo string) bool {
-	config := readConfig("config.json")
-	if config == nil {
-		fmt.Println("Failed to read config.")
-		return false
-	}
-
 	// Check blacklist
 	for _, entry := range config.BlackList {
 		if entry == author || entry == author+"/"+repo {
@@ -185,7 +151,7 @@ func allowDownload(author, repo string) bool {
 func readConfig(filename string) *Config {
 	file, err := os.Open(filename)
 	if err != nil {
-		fmt.Println("Error opening config file:", err)
+		log.Fatalf("Error opening config file: %v", err)
 		return nil
 	}
 	defer file.Close()
@@ -194,9 +160,28 @@ func readConfig(filename string) *Config {
 	config := Config{}
 	err = decoder.Decode(&config)
 	if err != nil {
-		fmt.Println("Error decoding config file:", err)
+		log.Fatalf("Error decoding config file: %v", err)
 		return nil
 	}
-
+	if config.Socks5 == "" {
+		log.Println("Using direct connection.")
+		transport = &http.Transport{
+			MaxIdleConns:        10,
+			IdleConnTimeout:     30 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		}
+	} else {
+		log.Println("Using SOCKS5 proxy:", config.Socks5)
+		dialer, err := proxy.SOCKS5("tcp", config.Socks5, nil, proxy.Direct)
+		if err != nil {
+			log.Fatalf("Failed to connect to the proxy: %v", err)
+		}
+		transport = &http.Transport{
+			Dial:                dialer.Dial,
+			MaxIdleConns:        10,
+			IdleConnTimeout:     30 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		}
+	}
 	return &config
 }
